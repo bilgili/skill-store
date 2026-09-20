@@ -11,7 +11,16 @@ from types import MappingProxyType
 
 import pytest
 
-from skill_store.models import BackendError, Skill, SkillStoreError, StoreConfig
+from skill_store import backends
+from skill_store import journal as journal_module
+from skill_store.journal import JournalCommittedError, MigrationIntent, MigrationJournal
+from skill_store.models import (
+    BackendCommittedError,
+    BackendError,
+    Skill,
+    SkillStoreError,
+    StoreConfig,
+)
 from skill_store.registry import Registry
 from skill_store.store import SkillStore
 
@@ -284,6 +293,64 @@ async def test_write_publishes_input_without_backend_relist(tmp_path, monkeypatc
         await store.close()
 
 
+async def test_committed_write_publishes_namespace_truth(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    try:
+        await directory(store, tmp_path)
+        await store.set_writable("local")
+        backend = store._backends["local"]
+        original = backend.write_tree
+
+        def committed(name, files, replace=False):
+            original(name, files, replace=replace)
+            raise BackendCommittedError("write")
+
+        monkeypatch.setattr(backend, "write_tree", committed)
+        result = await store.write_skill("new", FILES)
+        assert "warning" in result
+        assert store.snapshot["local/new"].files == FILES
+        assert (tmp_path / "local" / "new" / "SKILL.md").exists()
+    finally:
+        await store.close()
+
+
+def test_journal_clear_retry_reconfirms_absence(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    journal = MigrationJournal(state)
+    journal.save(MigrationIntent.create("source", "target", "same", FILES))
+
+    def fail():
+        raise OSError("parent sync")
+
+    monkeypatch.setattr(journal, "_sync_parent", fail)
+    with pytest.raises(SkillStoreError):
+        journal.clear()
+    assert not journal.path.exists()
+    calls = 0
+
+    def observe():
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(journal, "_sync_parent", observe)
+    journal.clear()
+    assert calls == 1
+
+
+def test_journal_stage_creation_failure_is_safe(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    journal = MigrationJournal(state)
+    monkeypatch.setattr(
+        journal_module.tempfile,
+        "mkstemp",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    with pytest.raises(SkillStoreError, match="Cannot save"):
+        journal.save(MigrationIntent.create("source", "target", "same", FILES))
+
+
 async def test_migration_retry_after_delete_failure_and_differing_target(tmp_path, monkeypatch):
     store = await running(tmp_path)
     try:
@@ -301,10 +368,16 @@ async def test_migration_retry_after_delete_failure_and_differing_target(tmp_pat
         monkeypatch.setattr(source, "delete_skill", fail)
         with pytest.raises(SkillStoreError):
             await store.migrate_skill("source", "same", "target")
+        journal = tmp_path / "state" / "migration.json"
+        assert stat.S_IMODE(journal.stat().st_mode) == 0o600
+        assert json.loads(journal.read_text())["phase"] == "deleting"
+        with pytest.raises(SkillStoreError, match="recovery requires"):
+            await store.set_writable("source")
         assert (source_root / "same" / "SKILL.md").exists()
         assert store.snapshot["target/same"].files == FILES
         monkeypatch.setattr(source, "delete_skill", original)
         await store.migrate_skill("source", "same", "target")
+        assert not journal.exists()
         assert not (source_root / "same").exists()
         assert (target_root / "same" / "SKILL.md").read_bytes() == FILES["SKILL.md"]
         await store.set_writable("source")
@@ -313,6 +386,285 @@ async def test_migration_retry_after_delete_failure_and_differing_target(tmp_pat
         with pytest.raises(SkillStoreError, match="different content"):
             await store.migrate_skill("source", "same", "target")
         assert (source_root / "same").exists()
+    finally:
+        await store.close()
+
+
+async def test_restart_finishes_committed_directory_retirement(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    source_root = await directory(store, tmp_path, "source")
+    await directory(store, tmp_path, "target")
+    await store.set_writable("source")
+    await store.write_skill("same", FILES)
+    await store.set_writable("target")
+    original = backends.shutil.rmtree
+
+    def fail_retired(path, *args, **kwargs):
+        if str(path).startswith(".skill-store-retired-"):
+            raise OSError("cleanup")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr("skill_store.backends.shutil.rmtree", fail_retired)
+    with pytest.raises(SkillStoreError, match="cleanup is pending"):
+        await store.migrate_skill("source", "same", "target")
+    assert not (source_root / "same").exists()
+    assert (tmp_path / "state" / "migration.json").exists()
+    await store.close()
+    monkeypatch.setattr("skill_store.backends.shutil.rmtree", original)
+
+    restarted = SkillStore(tmp_path / "state")
+    await restarted.start()
+    try:
+        assert restarted._intent is None
+        assert not (tmp_path / "state" / "migration.json").exists()
+        assert "source/same" not in restarted.snapshot
+        assert "target/same" in restarted.snapshot
+        assert not list(source_root.glob(".skill-store-retired-*"))
+    finally:
+        await restarted.close()
+
+
+async def test_restart_blocks_delete_when_target_changed(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    source_root = await directory(store, tmp_path, "source")
+    target_root = await directory(store, tmp_path, "target")
+    await store.set_writable("source")
+    await store.write_skill("same", FILES)
+    await store.set_writable("target")
+    source = store._backends["source"]
+
+    def fail(_name):
+        raise BackendError("Deletion failed.")
+
+    monkeypatch.setattr(source, "delete_skill", fail)
+    with pytest.raises(SkillStoreError):
+        await store.migrate_skill("source", "same", "target")
+    await store.close()
+    (target_root / "same" / "SKILL.md").write_bytes(b"changed")
+
+    restarted = SkillStore(tmp_path / "state")
+    await restarted.start()
+    try:
+        assert restarted._intent is not None
+        assert (source_root / "same" / "SKILL.md").exists()
+        with pytest.raises(SkillStoreError, match="different content"):
+            await restarted.migrate_skill("source", "same", "target")
+        assert (source_root / "same" / "SKILL.md").exists()
+    finally:
+        await restarted.close()
+
+
+async def test_recovery_rejects_hidden_changed_source(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    try:
+        source_root = await directory(store, tmp_path, "source")
+        await directory(store, tmp_path, "target")
+        await store.set_writable("source")
+        await store.write_skill("same", FILES)
+        await store.set_writable("target")
+        source = store._backends["source"]
+        original = source.delete_skill
+        monkeypatch.setattr(
+            source, "delete_skill", lambda _name: (_ for _ in ()).throw(BackendError("fail"))
+        )
+        with pytest.raises(SkillStoreError):
+            await store.migrate_skill("source", "same", "target")
+        (source_root / "same" / "SKILL.md").unlink()
+        (source_root / "same" / "references" / "raw.bin").write_bytes(b"changed")
+        monkeypatch.setattr(source, "delete_skill", original)
+        with pytest.raises(SkillStoreError, match="source skill changed"):
+            await store.migrate_skill("source", "same", "target")
+        assert (source_root / "same" / "references" / "raw.bin").exists()
+    finally:
+        await store.close()
+
+
+async def test_target_publication_precedes_deleting_journal_commit(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    try:
+        await directory(store, tmp_path, "source")
+        await directory(store, tmp_path, "target")
+        await store.set_writable("source")
+        await store.write_skill("same", FILES)
+        await store.set_writable("target")
+        original = store._journal.save
+        calls = 0
+
+        def fail_second(intent):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise SkillStoreError("journal failed")
+            original(intent)
+
+        monkeypatch.setattr(store._journal, "save", fail_second)
+        with pytest.raises(SkillStoreError, match="journal failed"):
+            await store.migrate_skill("source", "same", "target")
+        assert store.snapshot["target/same"].files == FILES
+        assert store.snapshot["source/same"].files == FILES
+        assert store._intent is not None and store._intent.phase == "copying"
+    finally:
+        await store.close()
+
+
+async def test_target_publication_precedes_reconciliation_failure(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    try:
+        await directory(store, tmp_path, "source")
+        await directory(store, tmp_path, "target")
+        await store.set_writable("source")
+        await store.write_skill("same", FILES)
+        await store.set_writable("target")
+        target = store._backends["target"]
+        monkeypatch.setattr(
+            target,
+            "reconcile_tree",
+            lambda *_args: (_ for _ in ()).throw(BackendError("sync failed")),
+        )
+        with pytest.raises(SkillStoreError, match="sync failed"):
+            await store.migrate_skill("source", "same", "target")
+        assert store.snapshot["target/same"].files == FILES
+        assert store.snapshot["source/same"].files == FILES
+    finally:
+        await store.close()
+
+
+async def test_failed_startup_recovery_disables_mutations(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    await directory(store, tmp_path, "source")
+    await directory(store, tmp_path, "target")
+    await store.set_writable("source")
+    await store.write_skill("same", FILES)
+    await store.set_writable("target")
+    source = store._backends["source"]
+    monkeypatch.setattr(
+        source, "delete_skill", lambda _name: (_ for _ in ()).throw(BackendError("fail"))
+    )
+    with pytest.raises(SkillStoreError):
+        await store.migrate_skill("source", "same", "target")
+    await store.close()
+
+    restarted = SkillStore(tmp_path / "state")
+    entered, release = threading.Event(), threading.Event()
+
+    def fail_recovery():
+        entered.set()
+        assert release.wait(5)
+        raise OSError("recovery failed")
+
+    monkeypatch.setattr(restarted, "_resume_intent", fail_recovery)
+    startup = asyncio.create_task(restarted.start())
+    assert await asyncio.to_thread(entered.wait, 5)
+    with pytest.raises(SkillStoreError, match="not running"):
+        await restarted.write_skill("queued", FILES)
+    release.set()
+    with pytest.raises(SkillStoreError):
+        await startup
+    assert restarted._started is False
+    with pytest.raises(SkillStoreError, match="not running"):
+        await restarted.write_skill("other", FILES)
+
+
+async def test_resumed_delete_requires_confirmed_journal(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    try:
+        source_root = await directory(store, tmp_path, "source")
+        await directory(store, tmp_path, "target")
+        await store.set_writable("source")
+        await store.write_skill("same", FILES)
+        await store.set_writable("target")
+        source = store._backends["source"]
+        original_delete = source.delete_skill
+        monkeypatch.setattr(
+            source, "delete_skill", lambda _name: (_ for _ in ()).throw(BackendError("fail"))
+        )
+        with pytest.raises(SkillStoreError):
+            await store.migrate_skill("source", "same", "target")
+        monkeypatch.setattr(source, "delete_skill", original_delete)
+        monkeypatch.setattr(
+            store._journal,
+            "save",
+            lambda _intent: (_ for _ in ()).throw(JournalCommittedError("uncertain")),
+        )
+        with pytest.raises(JournalCommittedError):
+            await store.migrate_skill("source", "same", "target")
+        assert (source_root / "same" / "SKILL.md").exists()
+    finally:
+        await store.close()
+
+
+async def test_recovery_rechecks_target_capacity_before_write(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    try:
+        await directory(store, tmp_path, "source")
+        target_root = await directory(store, tmp_path, "target")
+        await store.set_writable("source")
+        await store.write_skill("same", FILES)
+        await store.set_writable("target")
+        await store.write_skill("other", FILES)
+        store._save_intent(MigrationIntent.create("source", "target", "same", FILES))
+        monkeypatch.setattr("skill_store.store.MAX_SKILLS_PER_STORE", 1)
+        with pytest.raises(SkillStoreError, match="count limit"):
+            await store.migrate_skill("source", "same", "target")
+        assert not (target_root / "same").exists()
+        assert "source/same" in store.snapshot
+    finally:
+        await store.close()
+
+
+async def test_case_alias_rejection_does_not_create_journal(tmp_path):
+    store = await running(tmp_path)
+    try:
+        await directory(store, tmp_path, "source")
+        await directory(store, tmp_path, "target")
+        await store.set_writable("source")
+        await store.write_skill("SAMPLE", FILES)
+        await store.set_writable("target")
+        await store.write_skill("sample", FILES)
+        with pytest.raises(SkillStoreError, match="case-insensitive"):
+            await store.migrate_skill("source", "SAMPLE", "target")
+        assert store._intent is None
+        assert not (tmp_path / "state" / "migration.json").exists()
+    finally:
+        await store.close()
+
+
+async def test_occupied_target_slot_does_not_create_journal(tmp_path):
+    store = await running(tmp_path)
+    try:
+        await directory(store, tmp_path, "source")
+        target_root = await directory(store, tmp_path, "target")
+        await store.set_writable("source")
+        await store.write_skill("occupied", FILES)
+        (target_root / "occupied").write_bytes(b"unmanaged")
+        await store.set_writable("target")
+        with pytest.raises(SkillStoreError, match="slot is occupied"):
+            await store.migrate_skill("source", "occupied", "target")
+        assert store._intent is None
+        assert not (tmp_path / "state" / "migration.json").exists()
+    finally:
+        await store.close()
+
+
+async def test_pending_migration_allows_credential_repair_only(tmp_path, monkeypatch):
+    store = await running(tmp_path)
+    try:
+        source_root = await directory(store, tmp_path, "source")
+        await directory(store, tmp_path, "target")
+        await store.set_writable("source")
+        await store.write_skill("same", FILES)
+        await store.set_writable("target")
+        source = store._backends["source"]
+        monkeypatch.setattr(
+            source, "delete_skill", lambda _name: (_ for _ in ()).throw(BackendError("fail"))
+        )
+        with pytest.raises(SkillStoreError):
+            await store.migrate_skill("source", "same", "target")
+        result = await store.update_store("source", {"credential": "replacement"})
+        assert result["store"]["credential"] != "replacement"
+        with pytest.raises(SkillStoreError, match="storage identity"):
+            await store.update_store("source", {"path": str(tmp_path / "other")})
+        assert (source_root / "same" / "SKILL.md").exists()
     finally:
         await store.close()
 
@@ -450,8 +802,8 @@ async def test_git_store_is_copy_only_and_poll_refreshes_content(tmp_path, monke
         with pytest.raises(SkillStoreError, match="support writes"):
             await store.set_writable("git")
         await store.set_writable("target")
-        result = await store.migrate_skill("git", "example", "target")
-        assert result["copied"] is True and result["moved"] is False
+        result = await store.migrate_store("git", "target")
+        assert result == {"moved": 0, "copied": 1, "remaining": 0, "error": None}
         assert (root / "example" / "SKILL.md").read_bytes() == b"initial"
         assert store.use_skill("git/example")["body"] == "initial"
         git_commit(root, b"refreshed")

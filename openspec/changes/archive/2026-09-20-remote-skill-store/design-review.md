@@ -24,27 +24,32 @@ The amended design contains these corrections. No unresolved blocking design fin
 
 ## Model evidence
 
-SANY parses all three modules. TLC checks nineteen configurations.
-Six configurations pass. Thirteen configurations produce the required counterexample.
+SANY parses all four modules. TLC checks 35 configurations.
+Eleven configurations pass. Twenty-four configurations produce the required counterexample.
 
 | Model | Accepted configurations | Distinct states |
 |---|---|---|
 | Registry | Registry.cfg | 2,528 |
-| Publication | directory | 5 |
+| Publication | directory | 6 |
 | Publication | s3 | 11 |
 | Publication | s3-live | 5 |
-| Migration | directory | 33 |
-| Migration | git | 25 |
+| Migration | directory | 8 |
+| Migration | git | 8 |
+| Migration journal | accepted | 30 |
 
 Registry checks separate durable and memory records. Writable values are sets, which makes cardinality failures observable.
 It checks capable writable stores, removal, publication order, cancellation ownership, and crash recovery.
 Migration checks per-file copy, verification, document-first deletion, Git survival, publication, and retry after a crash.
 Publication checks complete catalog reads, obsolete-file cleanup, and directory generation consistency.
+The journal checks durable intent, target identity, resumed verification, residue cleanup, and safe refusal.
 
 Negative configurations detect multiple writable stores, writable Git stores, unpersisted publication, and early lock release.
 They also detect premature source deletion, bad verification, deleted Git sources, and premature catalog publication.
 Publication faults detect missing files, obsolete files, and early snapshot publication.
 Two expected counterexamples document S3 behavior: mixed external reads and mixed snapshots after crash recovery.
+
+The final Codex review found no P0, P1, or P2 findings.
+The final architecture spot check reported no blockers.
 
 The liveness properties require fair recovery scheduling. Repeated crashes do not guarantee mutation completion.
 The models assume atomic filesystem exchange and correct point reads. Backend tests must establish these implementation assumptions.

@@ -30,6 +30,18 @@ class BackendError(SkillStoreError):
     """A safe storage failure."""
 
 
+class BackendCommittedError(BackendError):
+    """The public namespace changed, but durability or cleanup is uncertain."""
+
+    def __init__(self, operation: str) -> None:
+        if operation not in {"write", "delete"}:
+            raise ValueError("Invalid committed operation.")
+        self.operation = operation
+        super().__init__(
+            "The storage change committed, but durability or cleanup could not be confirmed."
+        )
+
+
 def validate_name(name: str) -> str:
     if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", name):
         raise SkillStoreError("Invalid store name.")

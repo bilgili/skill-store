@@ -37,15 +37,8 @@ DeleteFiles == /\ phase = "delete-files"
 Publish == /\ phase = "publish" /\ targetView' = target /\ sourceView' = source
            /\ phase' = "done"
            /\ UNCHANGED <<source, target, verified>>
-Crash == /\ phase \in {"copy", "document", "verify", "delete", "delete-files", "publish"}
-         /\ phase' = "crashed" /\ verified' = FALSE
-         /\ UNCHANGED <<source, target, sourceView, targetView>>
-Reload == /\ phase = "crashed"
-          /\ sourceView' = source /\ targetView' = target
-          /\ phase' = IF source["doc"] = 0 THEN "done" ELSE IF target = Full THEN "verify" ELSE "start"
-          /\ UNCHANGED <<source, target, verified>>
-Next == Start \/ CopySupport \/ CopyDocument \/ Verify \/ Delete \/ DeleteFiles \/ Publish \/ Crash \/ Reload
-Spec == Init /\ [][Next]_vars /\ WF_vars(Reload)
+Next == Start \/ CopySupport \/ CopyDocument \/ Verify \/ Delete \/ DeleteFiles \/ Publish
+Spec == Init /\ [][Next]_vars
 TypeOK == /\ source \in [Keys -> 0..1] /\ target \in [Keys -> 0..1]
           /\ sourceView \in [Keys -> 0..1] /\ targetView \in [Keys -> 0..1]
           /\ verified \in BOOLEAN
@@ -53,5 +46,4 @@ NoDataLoss == source = Full \/ target = Full
 GitSourceSurvives == SourceKind = "git" => source = Full
 VerifyBeforeDelete == (phase \in {"delete-files", "publish"}) => verified /\ target = Full
 CatalogEntryFullyResolvable == Complete(sourceView) /\ Complete(targetView)
-RecoveryCompletes == (phase = "crashed") ~> (phase # "crashed")
 =============================================================================

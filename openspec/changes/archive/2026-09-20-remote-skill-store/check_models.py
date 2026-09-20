@@ -7,6 +7,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 EXPECTED = {
+    "MigrationJournal.cfg": None,
+    "MigrationJournal-no-journal.cfg": "JournalBeforeDelete",
+    "MigrationJournal-clear-early.cfg": "JournalBeforeDelete",
+    "MigrationJournal-stale-view.cfg": "CatalogNoGhost",
+    "MigrationJournal-skip-reverify.cfg": "VerifiedBeforeDelete",
+    "MigrationJournal-target-mismatch.cfg": None,
+    "MigrationJournal-undurable.cfg": "DurableBeforeDelete",
+    "MigrationJournal-existing-different.cfg": None,
+    "MigrationJournal-overwrite-different.cfg": "DifferentTargetPreserved",
+    "MigrationJournal-bypass-mismatch.cfg": "VerifiedBeforeDelete",
+    "MigrationJournal-clear-residue.cfg": "CompletionClearsState",
+    "Publication-directory-create.cfg": None,
+    "Publication-directory-delete.cfg": None,
+    "Publication-stale-create.cfg": "ErrorPublicationMatchesTree",
+    "Publication-stale-replace.cfg": "ErrorPublicationMatchesTree",
+    "Publication-stale-delete.cfg": "ErrorPublicationMatchesTree",
     "Registry.cfg": None,
     "Registry-multi.cfg": "AtMostOneWritable",
     "Registry-git.cfg": "WritableIsCapable",
@@ -30,7 +46,7 @@ EXPECTED = {
 
 
 def main():
-    for module in ("Registry", "Publication", "Migration"):
+    for module in ("Registry", "Publication", "Migration", "MigrationJournal"):
         result = subprocess.run(
             ["sany", f"{module}.tla"], cwd=ROOT, capture_output=True, text=True, timeout=60
         )

@@ -9,10 +9,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeVar
 
-from .backends import backends_overlap, make_backend
+from .backends import backends_overlap, make_backend, same_storage_identity
+from .journal import JournalCommittedError, MigrationIntent, MigrationJournal
 from .models import (
     MAX_SKILLS_PER_STORE,
     MAX_STORE_BYTES,
+    BackendCommittedError,
+    BackendError,
     Skill,
     SkillStoreError,
     StoreConfig,
@@ -32,6 +35,8 @@ class SkillStore:
 
     def __init__(self, state_dir: str | Path):
         self.registry = Registry(state_dir)
+        self._journal = MigrationJournal(self.registry.path)
+        self._intent: MigrationIntent | None = None
         self.snapshot: Mapping[str, Skill] = MappingProxyType({})
         self._backends: dict[str, object] = {}
         self._errors: dict[str, str] = {}
@@ -100,6 +105,7 @@ class SkillStore:
         def load() -> None:
             self.registry.open()
             try:
+                self._intent = self._journal.load()
                 snapshot: dict[str, Skill] = {}
                 for name, config in self.registry.stores.items():
                     try:
@@ -109,8 +115,14 @@ class SkillStore:
                     except Exception:
                         self._errors[name] = "Store refresh failed."
                 self.snapshot = MappingProxyType(snapshot)
+                if self._intent is not None:
+                    try:
+                        self._resume_intent()
+                    except SkillStoreError:
+                        self._errors[self._intent.from_store] = "Migration recovery is pending."
                 self._started = True
             except BaseException:
+                self._started = False
                 self.registry.close()
                 raise
 
@@ -180,6 +192,17 @@ class SkillStore:
         snapshot = dict(self.snapshot)
         snapshot[skill.qualified_name] = skill
         self.snapshot = MappingProxyType(snapshot)
+
+    def _remove_skill(self, store: str, name: str) -> None:
+        snapshot = dict(self.snapshot)
+        snapshot.pop(f"{store}/{name}", None)
+        self.snapshot = MappingProxyType(snapshot)
+
+    def _intent_uses_store(self, name: str) -> bool:
+        return self._intent is not None and name in {
+            self._intent.from_store,
+            self._intent.to_store,
+        }
 
     def _commit_configuration(
         self,
@@ -320,6 +343,8 @@ class SkillStore:
                 config = replace(old, **changes)
             except TypeError:
                 raise SkillStoreError("Invalid store fields.") from None
+            if self._intent_uses_store(name) and not same_storage_identity(old, config):
+                raise SkillStoreError("A migration recovery requires the current storage identity.")
             backend = make_backend(config, self.registry.path)
             scanned = self._scan(config, backend)
             stores = dict(self.registry.stores)
@@ -339,6 +364,8 @@ class SkillStore:
 
     async def remove_store(self, name: str) -> dict:
         def operation() -> dict:
+            if self._intent_uses_store(name):
+                raise SkillStoreError("A migration recovery requires this store.")
             self._require_config(name)
             stores = dict(self.registry.stores)
             del stores[name]
@@ -357,6 +384,8 @@ class SkillStore:
 
     async def set_writable(self, name: str) -> dict:
         def operation() -> dict:
+            if self._intent is not None and name != self._intent.to_store:
+                raise SkillStoreError("A migration recovery requires the current writable store.")
             config = self._require_config(name)
             if config.kind not in {"directory", "s3"}:
                 raise SkillStoreError("The writable store must support writes.")
@@ -414,10 +443,24 @@ class SkillStore:
 
         def operation() -> dict:
             writable = self._writable()
+            if self._intent is not None and (
+                self._intent.skill == name
+                and writable in {self._intent.from_store, self._intent.to_store}
+            ):
+                raise SkillStoreError("A migration recovery is pending for this skill.")
             skill = Skill(writable, name, tree)
             self._check_capacity(skill)
             backend = self._backend(writable)
-            backend.write_tree(name, dict(skill.files), replace=replace)
+            try:
+                backend.write_tree(name, dict(skill.files), replace=replace)
+            except BackendCommittedError:
+                self._publish_skill(skill)
+                self._errors[writable] = "A storage change committed with uncertain durability."
+                return {
+                    "qualified_name": skill.qualified_name,
+                    "files": len(skill.files),
+                    "warning": "The write committed, but durability could not be confirmed.",
+                }
             self._publish_skill(skill)
             self._errors.pop(writable, None)
             return {"qualified_name": skill.qualified_name, "files": len(skill.files)}
@@ -432,8 +475,99 @@ class SkillStore:
             raise SkillStoreError("Migration stores must not overlap.")
         return self._backend(from_store), self._backend(to_store)
 
+    def _save_intent(self, intent: MigrationIntent) -> None:
+        try:
+            self._journal.save(intent)
+        except JournalCommittedError:
+            self._intent = intent
+            raise
+        else:
+            self._intent = intent
+
+    def _clear_intent(self) -> None:
+        self._journal.clear()
+        self._intent = None
+
+    def _migration_result(self, intent: MigrationIntent, *, copied: bool) -> dict:
+        return {
+            "from_store": intent.from_store,
+            "qualified_name": f"{intent.to_store}/{intent.skill}",
+            "copied": copied,
+            "moved": not copied,
+        }
+
+    def _finish_migration_source(
+        self, intent: MigrationIntent, source: object, expected_files: Mapping[str, bytes]
+    ) -> dict:
+        copied = self.registry.stores[intent.from_store].kind == "git"
+        if copied:
+            self._clear_intent()
+            self._errors.pop(intent.from_store, None)
+            return self._migration_result(intent, copied=True)
+
+        try:
+            source.verify_tree_or_absent(intent.skill, expected_files)
+        except BackendError:
+            raise SkillStoreError("The source skill changed during migration.") from None
+        try:
+            source.delete_skill(intent.skill)
+        except BackendCommittedError:
+            self._remove_skill(intent.from_store, intent.skill)
+            self._errors[intent.from_store] = "A migration deletion committed with cleanup pending."
+            raise SkillStoreError(
+                "The source was retired, but migration cleanup is pending."
+            ) from None
+        self._remove_skill(intent.from_store, intent.skill)
+        self._clear_intent()
+        self._errors.pop(intent.from_store, None)
+        return self._migration_result(intent, copied=False)
+
+    def _resume_intent(self) -> dict:
+        intent = self._intent
+        if intent is None:
+            raise SkillStoreError("No migration recovery is pending.")
+        source, target = self._migration_stores(intent.from_store, intent.to_store)
+        if intent.phase == "deleting":
+            self._save_intent(intent)
+        target_files = target.list_skills().get(intent.skill)
+        if target_files is None:
+            if intent.phase == "deleting":
+                raise SkillStoreError("The migration target no longer matches the journal.")
+            source_files = source.list_skills().get(intent.skill)
+            if source_files is None or not intent.verifies(source_files):
+                raise SkillStoreError("The migration source no longer matches the journal.")
+            self._check_capacity(Skill(intent.to_store, intent.skill, source_files))
+            try:
+                target.write_tree(intent.skill, source_files, replace=False)
+            except BackendCommittedError:
+                skill = Skill(intent.to_store, intent.skill, source_files)
+                self._publish_skill(skill)
+                self._errors[intent.to_store] = (
+                    "A migration target committed with uncertain durability."
+                )
+                raise SkillStoreError(
+                    "The target committed, but migration durability is pending."
+                ) from None
+            target_files = source_files
+        if not intent.verifies(target_files):
+            raise SkillStoreError("The migration target has different content.")
+        target.verify_tree(intent.skill, target_files)
+        destination = Skill(intent.to_store, intent.skill, target_files)
+        self._check_capacity(destination)
+        self._publish_skill(destination)
+        target.reconcile_tree(intent.skill, target_files)
+        if intent.phase == "copying":
+            intent = intent.deleting()
+            self._save_intent(intent)
+        self._errors.pop(intent.to_store, None)
+        return self._finish_migration_source(intent, source, target_files)
+
     def _migrate_one(self, from_store: str, name: str, to_store: str) -> dict:
         validate_skill_name(name)
+        if self._intent is not None:
+            if not self._intent.matches(from_store, to_store, name):
+                raise SkillStoreError("Another migration recovery is pending.")
+            return self._resume_intent()
         source, target = self._migration_stores(from_store, to_store)
         source_files = source.list_skills().get(name)
         if source_files is None:
@@ -444,24 +578,10 @@ class SkillStore:
         if existing is not None:
             if existing != dict(destination.files):
                 raise SkillStoreError("The target skill has different content.")
-        else:
-            target.write_tree(name, dict(destination.files), replace=False)
-        target.verify_tree(name, dict(destination.files))
-        # A verified target remains visible even if source deletion fails.
-        self._publish_skill(destination)
-        copied = self.registry.stores[from_store].kind == "git"
-        if not copied:
-            source.verify_tree(name, source_files)
-            source.delete_skill(name)
-            snapshot = dict(self.snapshot)
-            snapshot.pop(f"{from_store}/{name}", None)
-            self.snapshot = MappingProxyType(snapshot)
-        return {
-            "from_store": from_store,
-            "qualified_name": destination.qualified_name,
-            "copied": copied,
-            "moved": not copied,
-        }
+        target.validate_skill_slot(name)
+        intent = MigrationIntent.create(from_store, to_store, name, source_files)
+        self._save_intent(intent)
+        return self._resume_intent()
 
     async def migrate_skill(self, from_store: str, name: str, to_store: str) -> dict:
         return await self._mutate(lambda: self._migrate_one(from_store, name, to_store))
@@ -469,8 +589,24 @@ class SkillStore:
     async def migrate_store(self, from_store: str, to_store: str) -> dict:
         def operation() -> dict:
             source, _ = self._migration_stores(from_store, to_store)
-            names = sorted(source.list_skills())
             moved = copied = 0
+            recovered_name = None
+            if self._intent is not None:
+                if self._intent.from_store != from_store or self._intent.to_store != to_store:
+                    raise SkillStoreError("Another migration recovery is pending.")
+                try:
+                    recovered_name = self._intent.skill
+                    recovered = self._resume_intent()
+                    moved += int(recovered["moved"])
+                    copied += int(recovered["copied"])
+                except Exception:
+                    return {
+                        "moved": moved,
+                        "copied": copied,
+                        "remaining": len(source.list_skills()),
+                        "error": "Migration stopped. Recovery remains pending.",
+                    }
+            names = [name for name in sorted(source.list_skills()) if name != recovered_name]
             for index, name in enumerate(names):
                 try:
                     result = self._migrate_one(from_store, name, to_store)

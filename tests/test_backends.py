@@ -15,7 +15,14 @@ from skill_store.backends import (
     backends_overlap,
     make_backend,
 )
-from skill_store.models import BackendError, Skill, SkillStoreError, StoreConfig, validate_files
+from skill_store.models import (
+    BackendCommittedError,
+    BackendError,
+    Skill,
+    SkillStoreError,
+    StoreConfig,
+    validate_files,
+)
 
 FILES = {
     "SKILL.md": b"---\nname: sample\ndescription: A useful skill.\n---\n# Sample\n",
@@ -185,10 +192,82 @@ def test_stage_fsync_failure_preserves_original(directory, monkeypatch):
     assert directory.list_skills() == {"sample": FILES}
 
 
+def test_directory_rejects_case_alias_for_every_mutation(directory):
+    directory.write_tree("sample", FILES)
+    with pytest.raises(BackendError, match="case-insensitive"):
+        directory.write_tree("SAMPLE", {"SKILL.md": b"other"}, replace=True)
+    with pytest.raises(BackendError, match="case-insensitive"):
+        directory.delete_skill("SAMPLE")
+    assert directory.list_skills() == {"sample": FILES}
+
+
+@pytest.mark.parametrize("occupied_kind", ["file", "manifestless-directory"])
+def test_directory_slot_validation_rejects_hidden_occupants(directory, occupied_kind):
+    occupied = directory.root / "sample"
+    if occupied_kind == "file":
+        occupied.write_bytes(b"occupied")
+    else:
+        occupied.mkdir()
+        (occupied / "support.txt").write_bytes(b"occupied")
+    with pytest.raises(BackendError, match="slot is occupied"):
+        directory.validate_skill_slot("sample")
+
+
+def test_directory_reports_create_commit_before_parent_fsync(directory, monkeypatch):
+    renamed = False
+    original_rename = backends._atomic_rename
+    original_fsync = backends.os.fsync
+
+    def rename(*args, **kwargs):
+        nonlocal renamed
+        original_rename(*args, **kwargs)
+        renamed = True
+
+    def fsync(fd):
+        if renamed:
+            raise OSError("post-commit")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(backends, "_atomic_rename", rename)
+    monkeypatch.setattr(backends.os, "fsync", fsync)
+    with pytest.raises(BackendCommittedError) as caught:
+        directory.write_tree("sample", FILES)
+    assert caught.value.operation == "write"
+    assert (directory.root / "sample" / "SKILL.md").read_bytes() == FILES["SKILL.md"]
+
+
+def test_directory_delete_retry_cleans_stable_retired_tree(directory, monkeypatch):
+    directory.write_tree("sample", FILES)
+    original = backends.shutil.rmtree
+
+    def fail(path, *args, **kwargs):
+        if str(path).startswith(".skill-store-retired-"):
+            raise OSError("post-commit")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(backends.shutil, "rmtree", fail)
+    with pytest.raises(BackendCommittedError) as caught:
+        directory.delete_skill("sample")
+    assert caught.value.operation == "delete"
+    assert not (directory.root / "sample").exists()
+    assert len(list(directory.root.glob(".skill-store-retired-*"))) == 1
+    monkeypatch.setattr(backends.shutil, "rmtree", original)
+    directory.delete_skill("sample")
+    assert not list(directory.root.glob(".skill-store-retired-*"))
+
+
 def test_directory_verification_rejects_extra_files(directory):
     directory.write_tree("sample", FILES)
     with pytest.raises(BackendError, match="verification"):
         directory.verify_tree("sample", {"SKILL.md": FILES["SKILL.md"]})
+
+
+def test_directory_hidden_source_is_not_treated_as_absent(directory):
+    directory.write_tree("sample", FILES)
+    (directory.root / "sample" / "SKILL.md").unlink()
+    (directory.root / "sample" / "scripts" / "run.sh").write_bytes(b"changed")
+    with pytest.raises(BackendError, match="Source verification"):
+        directory.verify_tree_or_absent("sample", FILES)
 
 
 @pytest.mark.parametrize("target_kind", ["file", "directory", "fifo"])
@@ -286,6 +365,38 @@ def test_s3_manifest_publication_and_deletion_order(s3, monkeypatch):
     assert deletes[0] == "library/sample/SKILL.md"
 
 
+def test_s3_partial_delete_is_committed_and_retry_removes_orphans(s3, monkeypatch):
+    s3.write_tree("sample", FILES)
+    original = s3.client.delete_object
+
+    def fail_support(**arguments):
+        if arguments["Key"].endswith("raw.bin"):
+            raise ClientError({"Error": {"Code": "Denied", "Message": "private"}}, "Delete")
+        return original(**arguments)
+
+    monkeypatch.setattr(s3.client, "delete_object", fail_support)
+    with pytest.raises(BackendCommittedError) as caught:
+        s3.delete_skill("sample")
+    assert caught.value.operation == "delete"
+    assert s3.list_skills() == {}
+    assert s3.verify_tree_or_absent("sample", FILES) is False
+    s3.client.put_object(
+        Bucket=s3.config.bucket,
+        Key="library/sample/assets/raw.bin",
+        Body=b"changed",
+    )
+    with pytest.raises(BackendError, match="Source verification"):
+        s3.verify_tree_or_absent("sample", FILES)
+    s3.client.put_object(
+        Bucket=s3.config.bucket,
+        Key="library/sample/assets/raw.bin",
+        Body=FILES["assets/raw.bin"],
+    )
+    monkeypatch.setattr(s3.client, "delete_object", original)
+    s3.delete_skill("sample")
+    assert s3._keys("library/sample/", backends._Budget()) == {}
+
+
 def test_s3_failed_support_write_preserves_manifest(s3, monkeypatch):
     s3.write_tree("sample", FILES)
     original = s3.client.put_object
@@ -300,6 +411,16 @@ def test_s3_failed_support_write_preserves_manifest(s3, monkeypatch):
         s3.write_tree("sample", {"SKILL.md": b"new", "broken.txt": b"fail"}, replace=True)
     assert "SECRET" not in str(caught.value)
     assert s3.read_file("sample", "SKILL.md") == FILES["SKILL.md"]
+
+
+def test_s3_slot_validation_rejects_manifestless_prefix(s3):
+    s3.client.put_object(
+        Bucket=s3.config.bucket,
+        Key="library/sample/support.txt",
+        Body=b"occupied",
+    )
+    with pytest.raises(BackendError, match="slot is occupied"):
+        s3.validate_skill_slot("sample")
 
 
 def test_s3_verifies_with_head_and_get_never_list(s3, monkeypatch):

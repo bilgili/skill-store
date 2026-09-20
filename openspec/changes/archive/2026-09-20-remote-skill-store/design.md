@@ -41,6 +41,10 @@ Backends expose `writable_capable`.
 ## File safety and persistence
 Validate store names as `[a-z0-9][a-z0-9-]*`.
 Reject absolute paths, traversal, symlinks, special files, and duplicate normalized paths.
+Directory backends reject a skill name whose case-folded form matches another directory entry.
+The backend checks this rule before create, replacement, deletion, and migration-target mutation.
+Migration checks the target skill slot before it records an intent.
+Backend contract tests establish this filesystem assumption on case-sensitive and case-insensitive hosts.
 Every skill contains a UTF-8 `SKILL.md` file.
 Support UTF-8 text and explicit base64 binary inputs.
 Directory writes stage complete sibling trees and atomically exchange existing trees on supported platforms.
@@ -116,3 +120,75 @@ The fallback replaces that line with an empty string before it validates all rem
 It then uses the complete original description text and normalizes whitespace.
 The fallback rejects duplicate description lines, quoted values, structural prefixes, and other invalid YAML.
 This parsing clarification has no state transitions. It requires no additional TLA+ model.
+
+## Recoverable migration deletion
+
+The core persists one migration intent in `migration.json` before it writes a target.
+The file uses mode 0600, file synchronization, atomic replacement, and parent synchronization.
+The intent identifies the source store, target store, skill name, phase, paths, sizes, and SHA-256 digests.
+It contains no backend credential and no skill content.
+
+The `copying` phase permits target construction but forbids source deletion.
+The core verifies the complete target tree before it persists the `deleting` phase.
+Only the `deleting` phase permits source deletion.
+The core retains the intent until source cleanup finishes.
+Cleanup and journal removal are separate durable transitions.
+The directory backend derives one retired-tree name from the validated skill name.
+The retired-tree name is stable across process restarts and contains no skill content.
+The backend removes an existing retired tree before a new deletion.
+After a committed deletion error, a retry removes the same retired tree before it reports completion.
+The backend owns this cleanup. The core clears the intent only after the backend confirms cleanup.
+
+S3 deletion is idempotent when `SKILL.md` is already absent.
+It lists and deletes all remaining keys under the recorded skill prefix.
+A retry therefore completes cleanup after a partial document-first deletion.
+The core reconciles a committed deletion error by removing the source catalog entry.
+It keeps the intent so the next call or restart removes remaining objects.
+
+Startup resumes the durable intent before it starts Git polling.
+The core clears volatile verification state after restart.
+It verifies the target against recorded digests before any resumed source deletion.
+It also completes target durability reconciliation before it persists or resumes `deleting`.
+It rewrites and synchronizes a resumed `deleting` intent before source deletion.
+A failed parent synchronization therefore blocks source deletion.
+A mismatched target preserves the source and the durable intent.
+A target mismatch during resumed deletion blocks source deletion.
+A target with different content is never overwritten without explicit replacement authorization.
+A matching `migrate_skill` call resumes the intent.
+`migrate_store` resumes a matching intent before it enumerates visible source skills.
+The core rejects another migration while an intent exists.
+It rejects an update, removal, or writable-store change that can invalidate the intent.
+It permits credential repair when the store identity remains unchanged.
+
+`MigrationJournal.tla` models the durable phase across crash, reload, partial source deletion, and retry.
+The model checks that deletion requires a verified target and a durable `deleting` intent.
+It checks that a completed migration has no source object or journal record.
+It also checks that a completed migration has no retired tree or object residue.
+The liveness check assumes at most one crash and stable storage after restart.
+It applies weak fairness to retry, verification, deletion, cleanup, and journal removal.
+Negative configurations omit the journal, bypass mismatch checks, clear it early, or retain residue.
+
+## Namespace commit outcomes
+
+A backend owns the distinction between a failed operation and a committed operation with an uncertain durability result.
+Directory creation commits when the staged directory becomes the public directory.
+Directory replacement commits when native exchange succeeds.
+Directory deletion commits when the public directory moves to its retired location.
+
+After these commit points, synchronization or cleanup failure raises `BackendCommittedError`, a subtype of `BackendError`.
+The error carries a fixed public message. It contains no paths or credentials.
+The backend never rolls back a committed namespace change.
+Rollback creates another visible transition and can fail independently.
+
+The core catches this subtype while it still owns the mutation lock.
+After a committed write error, it publishes the exact input bytes and reports uncertain durability.
+After a committed source deletion error, it removes the source catalog entry and reports uncertain durability.
+A migration target write with this error publishes the target but preserves the source.
+Migration does not delete the source after an uncertain target write.
+A later retry must verify and reconcile durability before deleting the source.
+For a directory target, reconciliation synchronizes every public file, directory, and the store root.
+For S3, successful point reads follow the service durability contract.
+
+This rule also covers errors during cleanup of a displaced or retired tree.
+The old snapshot remains valid while the worker runs. Error completion requires reconciliation with the committed namespace.
+The amended publication and migration models check this requirement for accepted behavior and deliberately omitted reconciliation.

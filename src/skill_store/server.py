@@ -189,9 +189,11 @@ def create_server(
 
     server = FastMCP(
         "Skill Store",
-        instructions=(
-            "Load remote skills with use_skill. "
-            "Read instructions://self for the live catalog."
+        instructions=" ".join(
+            (
+                "Load remote skills with use_skill.",
+                "Read instructions://self for the live catalog.",
+            )
         ),
         lifespan=lifespan,
         middleware=[LiveInstructions(store)],

@@ -32,6 +32,7 @@ from .models import (
     MAX_SKILLS_PER_STORE,
     MAX_STORE_BYTES,
     SCAN_TIMEOUT,
+    BackendCommittedError,
     BackendError,
     StoreConfig,
     validate_files,
@@ -186,18 +187,27 @@ def _write_staged(fd: int, files: Mapping[str, bytes], budget: _Budget) -> None:
         finally:
             os.close(parent)
 
-    def sync_tree(directory: int) -> None:
-        for name in os.listdir(directory):
-            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
-            if stat.S_ISDIR(info.st_mode):
-                child = os.open(name, _DIR_FLAGS, dir_fd=directory)
-                try:
-                    sync_tree(child)
-                finally:
-                    os.close(child)
-        os.fsync(directory)
+    _sync_tree(fd)
 
-    sync_tree(fd)
+
+def _sync_tree(directory: int) -> None:
+    for name in os.listdir(directory):
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child = os.open(name, _DIR_FLAGS, dir_fd=directory)
+            try:
+                _sync_tree(child)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(info.st_mode):
+            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                os.fsync(file_fd)
+            finally:
+                os.close(file_fd)
+        else:
+            raise BackendError("Symbolic links and special files are not supported.")
+    os.fsync(directory)
 
 
 class Backend:
@@ -220,6 +230,9 @@ class Backend:
     def write_tree(self, skill: str, files: Mapping[str, bytes], replace: bool = False) -> None:
         raise BackendError("This store is read-only.")
 
+    def validate_skill_slot(self, skill: str) -> None:
+        validate_skill_name(skill)
+
     def delete_skill(self, skill: str) -> None:
         raise BackendError("This store is read-only.")
 
@@ -227,6 +240,17 @@ class Backend:
         expected = validate_files(files)
         if self.list_skills().get(skill) != expected:
             raise BackendError("Skill verification failed.")
+
+    def reconcile_tree(self, skill: str, files: Mapping[str, bytes]) -> None:
+        self.verify_tree(skill, files)
+
+    def verify_tree_or_absent(self, skill: str, files: Mapping[str, bytes]) -> bool:
+        current = self.list_skills().get(skill)
+        if current is None:
+            return False
+        if current != validate_files(files):
+            raise BackendError("Source verification failed.")
+        return True
 
     def refresh(self) -> None:
         return None
@@ -296,12 +320,25 @@ class DirectoryBackend(Backend):
         except OSError:
             raise BackendError("Skill file is unavailable or unsafe.") from None
 
+    @staticmethod
+    def _reject_case_alias(root: int, skill: str) -> None:
+        aliases = [name for name in os.listdir(root) if name.casefold() == skill.casefold()]
+        if any(name != skill for name in aliases):
+            raise BackendError("A case-insensitive skill alias already exists.")
+
+    @staticmethod
+    def _retired_name(skill: str) -> str:
+        digest = hashlib.sha256(skill.encode("utf-8")).hexdigest()[:32]
+        return ".skill-store-retired-" + digest
+
     def write_tree(self, skill: str, files: Mapping[str, bytes], replace: bool = False) -> None:
         validate_skill_name(skill)
         content = validate_files(files)
         stage = ".skill-store-stage-" + uuid.uuid4().hex
+        committed = False
         try:
             with _directory(self.root) as root:
+                self._reject_case_alias(root, skill)
                 existing = False
                 try:
                     info = os.stat(skill, dir_fd=root, follow_symlinks=False)
@@ -320,36 +357,103 @@ class DirectoryBackend(Backend):
                     finally:
                         os.close(fd)
                     _atomic_rename(root, stage, skill, exchange=existing)
+                    committed = True
                     os.fsync(root)
-                finally:
-                    try:
+                    if existing:
                         shutil.rmtree(stage, dir_fd=root)
                         os.fsync(root)
-                    except OSError:
-                        pass
+                finally:
+                    if not committed:
+                        try:
+                            shutil.rmtree(stage, dir_fd=root)
+                            os.fsync(root)
+                        except FileNotFoundError:
+                            pass
         except OSError:
+            if committed:
+                raise BackendCommittedError("write") from None
             raise BackendError("Directory write failed.") from None
 
-    def delete_skill(self, skill: str) -> None:
+    def validate_skill_slot(self, skill: str) -> None:
         validate_skill_name(skill)
-        retired = ".skill-store-deleted-" + uuid.uuid4().hex
         try:
             with _directory(self.root) as root:
+                self._reject_case_alias(root, skill)
                 try:
                     info = os.stat(skill, dir_fd=root, follow_symlinks=False)
                 except FileNotFoundError:
                     return
                 if not stat.S_ISDIR(info.st_mode):
-                    raise BackendError("Skill path is not a safe directory.")
-                _atomic_rename(root, skill, retired, exchange=False)
-                os.fsync(root)
+                    raise BackendError("The target skill slot is occupied.")
+                fd = os.open(skill, _DIR_FLAGS, dir_fd=root)
                 try:
+                    try:
+                        manifest = os.stat("SKILL.md", dir_fd=fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        raise BackendError("The target skill slot is occupied.") from None
+                    if not stat.S_ISREG(manifest.st_mode):
+                        raise BackendError("The target skill slot is occupied.")
+                finally:
+                    os.close(fd)
+        except OSError:
+            raise BackendError("Directory store is unavailable or unsafe.") from None
+
+    def delete_skill(self, skill: str) -> None:
+        validate_skill_name(skill)
+        retired = self._retired_name(skill)
+        committed = False
+        try:
+            with _directory(self.root) as root:
+                self._reject_case_alias(root, skill)
+                try:
+                    retired_info = os.stat(retired, dir_fd=root, follow_symlinks=False)
+                    if not stat.S_ISDIR(retired_info.st_mode):
+                        raise BackendCommittedError("delete")
                     shutil.rmtree(retired, dir_fd=root)
                     os.fsync(root)
-                except OSError:
+                except FileNotFoundError:
                     pass
+                except OSError:
+                    raise BackendCommittedError("delete") from None
+                try:
+                    info = os.stat(skill, dir_fd=root, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.fsync(root)
+                    return
+                if not stat.S_ISDIR(info.st_mode):
+                    raise BackendError("Skill path is not a safe directory.")
+                _atomic_rename(root, skill, retired, exchange=False)
+                committed = True
+                os.fsync(root)
+                shutil.rmtree(retired, dir_fd=root)
+                os.fsync(root)
+                committed = False
+        except BackendCommittedError:
+            raise
         except OSError:
+            if committed:
+                raise BackendCommittedError("delete") from None
             raise BackendError("Directory deletion failed.") from None
+
+    def verify_tree_or_absent(self, skill: str, files: Mapping[str, bytes]) -> bool:
+        validate_skill_name(skill)
+        expected = validate_files(files)
+        try:
+            with _directory(self.root) as root:
+                self._reject_case_alias(root, skill)
+                try:
+                    fd = os.open(skill, _DIR_FLAGS, dir_fd=root)
+                except FileNotFoundError:
+                    return False
+                try:
+                    actual = _tree_from_fd(fd, _Budget())
+                finally:
+                    os.close(fd)
+        except OSError:
+            raise BackendError("Source verification failed.") from None
+        if actual != expected:
+            raise BackendError("Source verification failed.")
+        return True
 
     def verify_tree(self, skill: str, files: Mapping[str, bytes]) -> None:
         validate_skill_name(skill)
@@ -365,6 +469,20 @@ class DirectoryBackend(Backend):
             raise BackendError("Skill verification failed.") from None
         if actual != expected:
             raise BackendError("Skill verification failed.")
+
+    def reconcile_tree(self, skill: str, files: Mapping[str, bytes]) -> None:
+        self.verify_tree(skill, files)
+        try:
+            with _directory(self.root) as root:
+                self._reject_case_alias(root, skill)
+                fd = os.open(skill, _DIR_FLAGS, dir_fd=root)
+                try:
+                    _sync_tree(fd)
+                finally:
+                    os.close(fd)
+                os.fsync(root)
+        except OSError:
+            raise BackendError("Skill durability reconciliation failed.") from None
 
 
 class S3Backend(Backend):
@@ -397,6 +515,16 @@ class S3Backend(Backend):
         if path:
             validate_relative_path(path)
         return self.prefix + skill + "/" + path
+
+    def validate_skill_slot(self, skill: str) -> None:
+        validate_skill_name(skill)
+        budget = _Budget()
+        try:
+            keys = self._keys(self._key(skill), budget)
+        except _IO_ERRORS:
+            raise BackendError("S3 slot validation failed.") from None
+        if keys and self._key(skill, "SKILL.md") not in keys:
+            raise BackendError("The target skill slot is occupied.")
 
     def _keys(self, prefix: str, budget: _Budget) -> dict[str, int]:
         result: dict[str, int] = {}
@@ -516,17 +644,25 @@ class S3Backend(Backend):
     def delete_skill(self, skill: str) -> None:
         budget = _Budget()
         prefix = self._key(skill)
+        committed = False
         try:
             previous = self._keys(prefix, budget)
             manifest = self._key(skill, "SKILL.md")
             budget.check()
             self.client.delete_object(Bucket=self.config.bucket, Key=manifest)
+            committed = True
             budget.check()
             for key in sorted(previous.keys() - {manifest}):
                 budget.check()
                 self.client.delete_object(Bucket=self.config.bucket, Key=key)
                 budget.check()
+        except BackendError:
+            if committed:
+                raise BackendCommittedError("delete") from None
+            raise
         except _IO_ERRORS:
+            if committed:
+                raise BackendCommittedError("delete") from None
             raise BackendError("S3 deletion failed.") from None
 
     def verify_tree(self, skill: str, files: Mapping[str, bytes]) -> None:
@@ -544,6 +680,33 @@ class S3Backend(Backend):
                     raise BackendError("Skill verification failed.")
         except _IO_ERRORS:
             raise BackendError("Skill verification failed.") from None
+
+    def verify_tree_or_absent(self, skill: str, files: Mapping[str, bytes]) -> bool:
+        content = validate_files(files)
+        budget = _Budget()
+        prefix = self._key(skill)
+        try:
+            keys = self._keys(prefix, budget)
+            actual = {
+                key[len(prefix) :]: self._get(key, budget)
+                for key in sorted(keys)
+                if not key.endswith("/")
+            }
+        except _IO_ERRORS:
+            raise BackendError("Source verification failed.") from None
+        if self._key(skill, "SKILL.md") not in keys:
+            expected_support = {
+                path: value for path, value in content.items() if path != "SKILL.md"
+            }
+            if any(
+                path not in expected_support or expected_support[path] != value
+                for path, value in actual.items()
+            ):
+                raise BackendError("Source verification failed.")
+            return False
+        if actual != content:
+            raise BackendError("Source verification failed.")
+        return True
 
 
 class GitBackend(Backend):
@@ -759,6 +922,24 @@ def backends_overlap(left: StoreConfig, right: StoreConfig) -> bool:
             or second.startswith(first + "/")
         )
     return False
+
+
+def same_storage_identity(left: StoreConfig, right: StoreConfig) -> bool:
+    if left.kind != right.kind or left.name != right.name:
+        return False
+    if left.kind == "directory":
+        return Path(left.path).resolve() == Path(right.path).resolve()
+    if left.kind == "s3":
+        return (
+            left.bucket,
+            left.prefix.rstrip("/"),
+            _endpoint(left.endpoint),
+        ) == (
+            right.bucket,
+            right.prefix.rstrip("/"),
+            _endpoint(right.endpoint),
+        )
+    return (left.url, left.ref) == (right.url, right.ref)
 
 
 def make_backend(config: StoreConfig, state_dir: str | Path) -> Backend:
