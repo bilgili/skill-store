@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from dataclasses import FrozenInstanceError
 
@@ -499,6 +500,35 @@ def test_git_reads_refreshes_and_stays_read_only(git_backend):
     assert backend.list_skills()["sample"] == FILES
     backend.refresh()
     assert backend.list_skills()["sample"]["SKILL.md"] == b"# Changed"
+
+
+def test_git_refresh_starts_no_maintenance(git_backend, tmp_path):
+    backend, _ = git_backend
+    trace = tmp_path / "trace"
+    backend._environment["GIT_TRACE"] = str(trace)
+    backend.refresh()
+    commands = [line for line in trace.read_text().splitlines() if "run_command:" in line]
+    assert commands
+    assert not [line for line in commands if re.search(r"run_command: git (maintenance|gc)\b", line)]
+
+
+def test_git_commands_disable_automatic_maintenance(git_backend, monkeypatch):
+    backend, _ = git_backend
+    commands = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        commands.append(args[0])
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(backends.subprocess, "Popen", recording_popen)
+    backend.refresh()
+    assert commands
+    for command in commands:
+        pairs = list(zip(command, command[1:]))
+        assert ("-c", "maintenance.auto=false") in pairs
+        assert ("-c", "gc.auto=0") in pairs
+        assert command.index("gc.auto=0") < command.index("--git-dir=" + str(backend.cache))
 
 
 def test_git_rejects_symlink_blobs(git_backend):

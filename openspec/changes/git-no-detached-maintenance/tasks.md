@@ -3,9 +3,9 @@
 - [x] 1.2 Record `git --version` of the production image in `design.md`.
 
 ## 2. Implementation
-- [ ] 2.1 Add the two `-c` pairs to the argument prefix in `GitBackend._run`.
-- [ ] 2.2 Add `test_git_refresh_starts_no_maintenance`: set `backend._environment["GIT_TRACE"]` to an absolute path, call `refresh()`, collect the `run_command:` lines, assert the list is not empty, and assert that no line matches `run_command: git (maintenance|gc)\b`.
-- [ ] 2.3 Add a test that the argument prefix holds `maintenance.auto=false` and `gc.auto=0` (guard for `gc.auto=0`).
+- [x] 2.1 Add the two `-c` pairs to the argument prefix in `GitBackend._run`.
+- [x] 2.2 Add `test_git_refresh_starts_no_maintenance`: set `backend._environment["GIT_TRACE"]` to an absolute path, call `refresh()`, collect the `run_command:` lines, assert the list is not empty, and assert that no line matches `run_command: git (maintenance|gc)\b`.
+- [x] 2.3 Add a test that the argument prefix holds `maintenance.auto=false` and `gc.auto=0` (guard for `gc.auto=0`).
 
 ## 3. Verification
 - [ ] 3.1 Remove the flags and see test 2.2 fail.

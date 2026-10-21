@@ -780,6 +780,12 @@ class GitBackend(Backend):
             "protocol.ext.allow=never",
             "-c",
             "init.templateDir=",
+            # Git >= 2.47 detaches "maintenance run --auto" after each fetch;
+            # the detached process becomes a zombie under a non-reaping PID 1.
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
         ]
         if bare:
             command.append("--git-dir=" + str(self.cache))
