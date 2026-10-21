@@ -782,6 +782,7 @@ class GitBackend(Backend):
             "init.templateDir=",
             # Git >= 2.47 detaches "maintenance run --auto" after each fetch;
             # the detached process becomes a zombie under a non-reaping PID 1.
+            # gc.auto=0 is a second guard for older Git that detaches "gc --auto".
             "-c",
             "maintenance.auto=false",
             "-c",

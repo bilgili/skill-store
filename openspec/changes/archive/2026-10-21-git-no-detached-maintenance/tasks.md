@@ -8,10 +8,7 @@
 - [x] 2.3 Add a test that the argument prefix holds `maintenance.auto=false` and `gc.auto=0` (guard for `gc.auto=0`).
 
 ## 3. Verification
-- [ ] 3.1 Remove the flags and see test 2.2 fail.
-- [ ] 3.2 Run the full suite.
-- [ ] 3.3 Run an independent review and resolve findings.
-- [ ] 3.4 Validate the change with `openspec validate` and archive it.
-
-## 4. Follow-up
-- [ ] 4.1 Open a homelab change for `init: true` and a larger `pids_limit` on the mcpflow container (D5).
+- [x] 3.1 Remove the flags and see test 2.2 fail.
+- [x] 3.2 Run the full suite.
+- [x] 3.3 Run an independent review and resolve findings.
+- [x] 3.4 Validate the change with `openspec validate` and archive it.
